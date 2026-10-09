@@ -3,11 +3,17 @@ use std::io::Read;
 
 #[cfg(feature = "basis-universal")]
 use basis_universal::{
-    DecodeFlags, LowLevelUastcTranscoder, SliceParametersUastc, TranscoderBlockFormat,
+    DecodeFlags, Ktx2Transcoder, LowLevelUastcTranscoder, SliceParametersUastc,
+    TranscoderBlockFormat, TranscoderTextureFormat,
 };
 use bevy_color::Srgba;
 use bevy_utils::default;
-#[cfg(any(feature = "flate2", feature = "zstd_rust", feature = "zstd_c"))]
+#[cfg(any(
+    feature = "flate2",
+    feature = "zstd_rust",
+    feature = "zstd_c",
+    feature = "basis-universal"
+))]
 use ktx2::SupercompressionScheme;
 use ktx2::{
     dfd::{Basic, Block, ChannelTypeQualifiers, SampleInformation},
@@ -47,6 +53,14 @@ pub fn ktx2_buffer_to_image(
     let layer_count = layer_count.max(1);
     let face_count = face_count.max(1);
     let depth = depth.max(1);
+
+    // KTX2 files with ETC1S + BasisLZ supercompression (as produced by
+    // `gltfpack -tc`) cannot be decoded by the `ktx2` crate — hand the whole
+    // file to basis-universal's ktx2 transcoder instead.
+    #[cfg(feature = "basis-universal")]
+    if supercompression_scheme == Some(SupercompressionScheme::BasisLZ) {
+        return ktx2_etc1s_basis_lz_to_image(buffer, supported_compressed_formats, is_srgb);
+    }
 
     // Handle supercompression
     let mut levels: Vec<Vec<u8>>;
@@ -301,6 +315,111 @@ pub fn ktx2_buffer_to_image(
             ..default()
         });
     }
+    Ok(image)
+}
+
+/// Decodes a KTX2 file with ETC1S + BasisLZ supercompression (as produced by
+/// `gltfpack -tc`) into a bevy [`Image`], using basis-universal's ktx2
+/// transcoder to unpack the BasisLZ codebook and transcode every level into
+/// a GPU block format.
+///
+/// Target format selection per the ETC1S DFD channels: single plane →
+/// [`TranscoderTextureFormat::BC7_RGBA`] (Basis stores color, not just red,
+/// in single-plane ETC1S), R+alpha → [`TranscoderTextureFormat::BC7_RGBA`],
+/// R+G (two-plane, e.g. normal maps) → [`TranscoderTextureFormat::BC5_RG`].
+/// Falls back to [`TranscoderTextureFormat::RGBA32`] when the device has no
+/// BC support.
+#[cfg(feature = "basis-universal")]
+fn ktx2_etc1s_basis_lz_to_image(
+    buffer: &[u8],
+    supported_compressed_formats: CompressedImageFormats,
+    is_srgb: bool,
+) -> Result<Image, TextureError> {
+    use wgpu_types::TextureDataOrder;
+
+    let mut transcoder = Ktx2Transcoder::new();
+    transcoder.init(buffer).map_err(|err| {
+        TextureError::SuperDecompressionError(format!(
+            "Failed to parse ETC1S/BasisLZ KTX2 file: {err:?}"
+        ))
+    })?;
+    if !transcoder.is_etc1s() {
+        return Err(TextureError::SuperDecompressionError(
+            "BasisLZ supercompression is only supported for ETC1S data".to_string(),
+        ));
+    }
+
+    // Map the ETC1S DFD channels to a texture channel layout: two planes
+    // with a G channel are R+G (e.g. normal maps), everything else is color.
+    let data_format = if transcoder.dfd_channel_id1() > 0
+        && transcoder.dfd_channel_id1() != 15
+    {
+        TextureChannelLayout::Rg
+    } else {
+        TextureChannelLayout::Rgb
+    };
+
+    let (transcode_block_format, texture_format) =
+        get_transcoded_formats(supported_compressed_formats, data_format, is_srgb);
+    // Translate the UASTC lowlevel output format enum to the equivalent
+    // ktx2_transcoder input format, or fall back to raw RGBA when neither
+    // BC nor ETC2 is available.
+    let transcode_texture_format = match transcode_block_format {
+        TranscoderBlockFormat::BC4 => TranscoderTextureFormat::BC4_R,
+        TranscoderBlockFormat::BC5 => TranscoderTextureFormat::BC5_RG,
+        TranscoderBlockFormat::BC7 => TranscoderTextureFormat::BC7_RGBA,
+        TranscoderBlockFormat::ETC2_EAC_R11 => TranscoderTextureFormat::ETC2_EAC_R11,
+        TranscoderBlockFormat::ETC2_EAC_RG11 => TranscoderTextureFormat::ETC2_EAC_RG11,
+        TranscoderBlockFormat::ETC2_RGBA => TranscoderTextureFormat::ETC2_RGBA,
+        TranscoderBlockFormat::ASTC_4x4 => TranscoderTextureFormat::ASTC_4x4_RGBA,
+        _ => TranscoderTextureFormat::RGBA32,
+    };
+
+    transcoder.start_transcoding().map_err(|err| {
+        TextureError::SuperDecompressionError(format!(
+            "Failed to decompress BasisLZ codebook: {err:?}"
+        ))
+    })?;
+
+    let level_count = transcoder.level_count();
+    let mut levels = Vec::with_capacity(level_count as usize);
+    for level_index in 0..level_count {
+        levels.push(transcoder.transcode_image_level(
+            level_index,
+            transcode_texture_format,
+            DecodeFlags::empty(),
+        ).map_err(|err| {
+            TextureError::SuperDecompressionError(format!(
+                "Failed to transcode mip level {level_index} from ETC1S/BasisLZ: {err:?}"
+            ))
+        })?);
+    }
+
+    if !supported_compressed_formats.supports(texture_format) {
+        return Err(TextureError::UnsupportedTextureFormat(format!(
+            "Format not supported by this GPU: {texture_format:?}",
+        )));
+    }
+
+    let mut image_data = Vec::new();
+    image_data.reserve_exact(levels.iter().map(Vec::len).sum());
+    levels.iter().for_each(|level| image_data.extend(level));
+
+    let mut image = Image::default();
+    image.texture_descriptor.format = texture_format;
+    image.data = Some(image_data);
+    image.data_order = TextureDataOrder::MipMajor;
+    image.texture_descriptor.size = Extent3d {
+        width: transcoder.width(),
+        height: transcoder.height(),
+        depth_or_array_layers: 1,
+    };
+    image.texture_descriptor.mip_level_count = level_count;
+    image.texture_descriptor.dimension = if transcoder.height() > 1 {
+        TextureDimension::D2
+    } else {
+        TextureDimension::D1
+    };
     Ok(image)
 }
 
