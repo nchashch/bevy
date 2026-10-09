@@ -1,5 +1,6 @@
 pub mod extensions;
 pub mod gltf_ext;
+mod meshopt;
 
 use alloc::sync::Arc;
 use async_lock::RwLock;
@@ -250,11 +251,17 @@ impl GltfLoader {
         load_context: &'b mut LoadContext<'c>,
         settings: &'b GltfLoaderSettings,
     ) -> Result<Gltf, GltfError> {
-        let gltf = if settings.validate {
+        let mut gltf = if settings.validate {
             gltf::Gltf::from_slice(bytes)?
         } else {
             gltf::Gltf::from_slice_without_validation(bytes)?
         };
+
+        // Virtual meshopt fallback buffers (declared with
+        // `EXT_meshopt_compression: { fallback: true }` and no data) are
+        // materialized by the decode pass instead.
+        let (meshopt_plans, meshopt_virtual_buffers) =
+            meshopt::parse_meshopt_plans(bytes)?;
 
         // clone extensions to start with a fresh processing state
         let mut extensions = loader.extensions.read().await.clone();
@@ -275,7 +282,14 @@ impl GltfLoader {
                 "Gltf file name invalid",
             ))))?
             .to_string();
-        let buffer_data = load_buffers(&gltf, load_context).await?;
+        // Virtual meshopt fallback buffers (declared with
+        // `EXT_meshopt_compression: { fallback: true }` and no data) are
+        // materialized by the decode pass instead.
+        let mut buffer_data =
+            load_buffers(&gltf, load_context, &meshopt_virtual_buffers).await?;
+        // Decode meshopt-compressed buffers (EXT_meshopt_compression) before
+        // any accessor data is read.
+        meshopt::decode_meshopt_buffers(&mut buffer_data, &meshopt_plans)?;
 
         let linear_textures = get_linear_textures(&gltf.document);
 
@@ -1917,11 +1931,17 @@ fn load_node(
 async fn load_buffers(
     gltf: &gltf::Gltf,
     load_context: &mut LoadContext<'_>,
+    virtual_buffers: &[usize],
 ) -> Result<Vec<Vec<u8>>, GltfError> {
     const VALID_MIME_TYPES: &[&str] = &["application/octet-stream", "application/gltf-buffer"];
 
     let mut buffer_data = Vec::new();
-    for buffer in gltf.buffers() {
+    for (buffer_index, buffer) in gltf.buffers().enumerate() {
+        if virtual_buffers.contains(&buffer_index) {
+            // Materialized by the meshopt decode pass.
+            buffer_data.push(Vec::new());
+            continue;
+        }
         match buffer.source() {
             gltf::buffer::Source::Uri(uri) => {
                 let uri = percent_encoding::percent_decode_str(uri)

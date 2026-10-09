@@ -67,6 +67,8 @@ percent-encoding = "2.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.140"
 smallvec = { version = "1", default-features = false }
+# For decoding of EXT_meshopt_compression buffer views (gltfpack -c)
+meshopt = "0.6.2"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 wgpu-types = { version = "30", default-features = false }
 
