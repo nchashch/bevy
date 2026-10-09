@@ -98,6 +98,12 @@ enum VertexAttributeIter<'a> {
     // Additional on-disk formats used for RGB colors
     U16x3(gltf::accessor::Iter<'a, [u16; 3]>, Normalization),
     U8x3(gltf::accessor::Iter<'a, [u8; 3]>, Normalization),
+    // Quantized signed 3-component attributes (normals, tangents) — KHR_mesh_quantization
+    S16x3(gltf::accessor::Iter<'a, [i16; 3]>, Normalization),
+    S8x3(gltf::accessor::Iter<'a, [i8; 3]>, Normalization),
+    // Quantized unsigned positions (KHR_mesh_quantization): raw integers,
+    // dequantized at render time via the node transform
+    U16x3Raw(gltf::accessor::Iter<'a, [u16; 3]>),
 }
 
 impl<'a> VertexAttributeIter<'a> {
@@ -107,6 +113,7 @@ impl<'a> VertexAttributeIter<'a> {
         buffer_data: &'a Vec<Vec<u8>>,
     ) -> Result<VertexAttributeIter<'a>, AccessFailed> {
         let normalization = Normalization(accessor.normalized());
+        let normalized = accessor.normalized();
         let format = (accessor.data_type(), accessor.dimensions());
         let acc = BufferAccessor {
             accessor,
@@ -130,8 +137,17 @@ impl<'a> VertexAttributeIter<'a> {
             (DataType::U8, Dimensions::Vec2) => acc.with_norm(VertexAttributeIter::U8x2),
             (DataType::I8, Dimensions::Vec4) => acc.with_norm(VertexAttributeIter::S8x4),
             (DataType::U8, Dimensions::Vec4) => acc.with_norm(VertexAttributeIter::U8x4),
-            (DataType::U16, Dimensions::Vec3) => acc.with_norm(VertexAttributeIter::U16x3),
+            (DataType::U16, Dimensions::Vec3) => {
+                if normalized {
+                    acc.with_norm(VertexAttributeIter::U16x3)
+                } else {
+                    // Quantized positions (KHR_mesh_quantization)
+                    acc.with_no_norm(VertexAttributeIter::U16x3Raw)
+                }
+            }
             (DataType::U8, Dimensions::Vec3) => acc.with_norm(VertexAttributeIter::U8x3),
+            (DataType::I16, Dimensions::Vec3) => acc.with_norm(VertexAttributeIter::S16x3),
+            (DataType::I8, Dimensions::Vec3) => acc.with_norm(VertexAttributeIter::S8x3),
             _ => Err(AccessFailed::UnsupportedFormat),
         }
     }
@@ -188,6 +204,52 @@ impl<'a> VertexAttributeIter<'a> {
             VertexAttributeIter::U8x4(it, n) => {
                 Ok(n.apply_either(it.collect(), Values::Unorm8x4, Values::Uint8x4))
             }
+            // Quantized signed 3-component attributes (normals, tangents —
+            // KHR_mesh_quantization). Normalized values scale into [-1, 1];
+            // unnormalized values are passed through as raw integers and
+            // dequantized at render time via the node transform.
+            VertexAttributeIter::S16x3(it, n) => Ok(Values::Float32x3(
+                it.map(|v| {
+                    let mut a = if n.0 {
+                        [
+                            v[0] as f32 / 32767.0,
+                            v[1] as f32 / 32767.0,
+                            v[2] as f32 / 32767.0,
+                        ]
+                    } else {
+                        [v[0] as f32, v[1] as f32, v[2] as f32]
+                    };
+                    if convert_coordinates {
+                        a = a.convert_coordinates();
+                    }
+                    a
+                })
+                .collect(),
+            )),
+            VertexAttributeIter::S8x3(it, n) => Ok(Values::Float32x3(
+                it.map(|v| {
+                    let mut a = if n.0 {
+                        [v[0] as f32 / 127.0, v[1] as f32 / 127.0, v[2] as f32 / 127.0]
+                    } else {
+                        [v[0] as f32, v[1] as f32, v[2] as f32]
+                    };
+                    if convert_coordinates {
+                        a = a.convert_coordinates();
+                    }
+                    a
+                })
+                .collect(),
+            )),
+            VertexAttributeIter::U16x3Raw(it) => Ok(Values::Float32x3(
+                it.map(|v| {
+                    let mut a = [v[0] as f32, v[1] as f32, v[2] as f32];
+                    if convert_coordinates {
+                        a = a.convert_coordinates();
+                    }
+                    a
+                })
+                .collect(),
+            )),
             _ => Err(AccessFailed::UnsupportedFormat),
         }
     }
