@@ -811,25 +811,47 @@ impl GltfLoader {
                     };
 
                     {
-                        let morph_target_reader = reader.read_morph_targets();
-                        if morph_target_reader.len() != 0 {
-                            mesh.set_morph_targets(
-                                morph_target_reader
-                                    .flat_map(|i| PrimitiveMorphAttributesIter {
-                                        convert_coordinates: convert_coordinates.rotate_meshes,
-                                        positions: i.0,
-                                        normals: i.1,
-                                        tangents: i.2,
-                                    })
-                                    .collect(),
-                            );
+                        // Quantized morph target accessors (KHR_mesh_quantization,
+                        // emitted by gltfpack -c) panic inside gltf::mesh::util's
+                        // f32 iterators — the dequantization factors are not
+                        // recoverable at accessor level. Skip morphs for such
+                        // meshes (model still loads; morph animation won't play).
+                        let morphs_readable = primitive
+                            .morph_targets()
+                            .flat_map(|t| [t.positions(), t.normals(), t.tangents()].into_iter().flatten())
+                            .all(|acc| {
+                                matches!(
+                                    acc.data_type(),
+                                    gltf::accessor::DataType::F32
+                                )
+                            });
+                        if morphs_readable {
+                            let morph_target_reader = reader.read_morph_targets();
+                            if morph_target_reader.len() != 0 {
+                                mesh.set_morph_targets(
+                                    morph_target_reader
+                                        .flat_map(|i| PrimitiveMorphAttributesIter {
+                                            convert_coordinates: convert_coordinates.rotate_meshes,
+                                            positions: i.0,
+                                            normals: i.1,
+                                            tangents: i.2,
+                                        })
+                                        .collect(),
+                                );
 
-                            let extras = gltf_mesh.extras().as_ref();
-                            if let Some(names) = extras.and_then(|extras| {
-                                serde_json::from_str::<MorphTargetNames>(extras.get()).ok()
-                            }) {
-                                mesh.set_morph_target_names(names.target_names);
+                                let extras = gltf_mesh.extras().as_ref();
+                                if let Some(names) = extras.and_then(|extras| {
+                                    serde_json::from_str::<MorphTargetNames>(extras.get()).ok()
+                                }) {
+                                    mesh.set_morph_target_names(names.target_names);
+                                }
                             }
+                        } else {
+                            warn!(
+                                "Skipping quantized (non-f32) morph targets on mesh {} — \
+                                 morph animation will not play",
+                                gltf_mesh.index()
+                            );
                         }
                     }
                     mesh

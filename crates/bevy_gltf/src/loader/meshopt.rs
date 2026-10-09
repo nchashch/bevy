@@ -94,6 +94,19 @@ pub(super) fn parse_meshopt_plans(
     let mut meshopt_buffers = std::collections::HashSet::new();
     let mut plain_buffers = std::collections::HashSet::new();
     let mut virtual_buffers = Vec::new();
+    // Declared byte lengths of all buffers (the authoritative size of a
+    // virtual decoded buffer, including alignment padding between views).
+    let mut buffer_lengths = std::collections::HashMap::new();
+    let buffers_list = root
+        .get("buffers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for (i, buffer) in buffers_list.iter().enumerate() {
+        if let Some(len) = buffer.get("byteLength").and_then(Value::as_u64) {
+            buffer_lengths.insert(i, len);
+        }
+    }
     for view in root
         .get("bufferViews")
         .and_then(Value::as_array)
@@ -125,7 +138,9 @@ pub(super) fn parse_meshopt_plans(
                     buffer_index,
                     source_buffer: 0,
                     views: Vec::new(),
-                    decoded_len: 0,
+                    // Authoritative: the declared virtual-buffer size includes
+                    // alignment padding between views.
+                    decoded_len: buffer_lengths.get(&buffer_index).copied().unwrap_or(0),
                 });
                 plans.last_mut().unwrap()
             }
@@ -175,7 +190,6 @@ pub(super) fn parse_meshopt_plans(
             stride: ext.get("byteStride").and_then(Value::as_u64).ok_or_else(|| missing("byteStride"))?,
             filter,
         });
-        plan.decoded_len += decoded_byte_length;
     }
     for (i, buffer) in root
         .get("buffers")
@@ -202,13 +216,26 @@ pub(super) fn parse_meshopt_plans(
 /// stride. Only the strides gltfpack emits are supported (2, 4, 6, 8, 12,
 /// 16, 32 bytes).
 fn decode_attributes(src: &[u8], count: usize, stride: usize) -> Result<Vec<u8>, GltfError> {
+    // Byte-array wrapper with a manual Default: std only derives Default for
+    // arrays up to 32 elements, but gltfpack emits padded strides beyond that.
+    #[derive(Clone)]
+    struct Bytes<const N: usize>([u8; N]);
+    impl<const N: usize> Default for Bytes<N> {
+        fn default() -> Self {
+            Self([0u8; N])
+        }
+    }
+
     macro_rules! decode_with_stride {
         ($n:literal) => {{
-            let blocks = decode_vertex_buffer::<[u8; $n]>(src, count)
+            let blocks = decode_vertex_buffer::<Bytes<$n>>(src, count)
                 .map_err(|err| {
                     invalid(&format!("meshopt_decodeVertexBuffer failed: {err:?}"))
                 })?;
-            return Ok(blocks.into_iter().flatten().collect());
+            return Ok(blocks
+                .into_iter()
+                .flat_map(|b| b.0)
+                .collect());
         }};
     }
     match stride {
@@ -218,7 +245,10 @@ fn decode_attributes(src: &[u8], count: usize, stride: usize) -> Result<Vec<u8>,
         8 => decode_with_stride!(8),
         12 => decode_with_stride!(12),
         16 => decode_with_stride!(16),
+        24 => decode_with_stride!(24),
         32 => decode_with_stride!(32),
+        48 => decode_with_stride!(48),
+        64 => decode_with_stride!(64),
         other => Err(invalid(&format!(
             "Unsupported meshopt vertex stride: {other}"
         ))),
@@ -283,9 +313,13 @@ pub(super) fn decode_meshopt_buffers(
 
             let dst_start = view.byte_offset as usize;
             let dst_end = dst_start + out.len();
-            let dst = decoded
-                .get_mut(dst_start..dst_end)
-                .ok_or_else(|| invalid("Meshopt view does not fit its decoded buffer"))?;
+            let decoded_len_size = decoded.len();
+            let dst = decoded.get_mut(dst_start..dst_end).ok_or_else(|| {
+                invalid(&format!(
+                    "Meshopt view does not fit its decoded buffer: dst={dst_start}..{dst_end} decoded_len={}",
+                    decoded_len_size
+                ))
+            })?;
             dst.copy_from_slice(&out);
         }
         buffer_data[plan.buffer_index] = decoded;
